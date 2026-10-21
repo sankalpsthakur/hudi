@@ -1,0 +1,362 @@
+name: Validate module tests
+
+# Fork-only validation of a hudi-common change against the modules that consume it.
+# Every job runs twice: variant "fix" = the branch as pushed, variant "base" = the same tree with
+# hudi-common put back to the base commit. A failure is only a finding if it happens with "fix" and
+# not with "base"; the compare job at the end lists exactly that.
+
+on:
+  push:
+    branches:
+      - 'validate/**'
+    # the compatibility probes live in their own workflow; touching only these files must not start this one
+    paths-ignore:
+      - '.github/workflows/validate-modules.yml'
+      - '.github/workflows/validate-compat.yml'
+      - '.github/scripts/compat/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BASE_SHA: 31f4a5ef2de3023ef3374a42133d6679b06747e5
+  # Same retry knobs as .github/workflows/bot.yml; checks that only lint the sources are skipped.
+  MVN_ARGS: >-
+    -e -ntp -B -V -Dgpg.skip -Djacoco.skip=true -Dcheckstyle.skip=true -Drat.skip=true -Dscalastyle.skip=true
+    -Pwarn-log
+    -Dorg.slf4j.simpleLogger.log.org.apache.maven.plugins.shade=warn
+    -Dorg.slf4j.simpleLogger.log.org.apache.maven.plugins.dependency=warn
+    -Daether.connector.http.retryHandler.count=5
+    -Daether.connector.http.retryHandler.interval=3000
+    -Daether.connector.http.retryHandler.intervalMax=30000
+    -Daether.connector.http.retryHandler.serviceUnavailable=429,500,502,503,504
+    -Daether.connector.http.connectionMaxTtl=25
+    -Dorg.eclipse.jetty.LEVEL=WARN
+
+jobs:
+  # hudi-hadoop-common, hudi-client/*, hudi-hadoop-mr: JUnit classes that parse or convert InternalSchema.
+  common-deps:
+    name: common-deps (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 170
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [fix, base]
+    env:
+      MODULES: hudi-hadoop-common,hudi-hadoop-mr,hudi-client/hudi-client-common,hudi-client/hudi-spark-client,hudi-client/hudi-flink-client
+      JUNIT_TESTS: >-
+        TestFileBasedInternalSchemaStorageManager,TestTableSchemaResolver,TestTableStateSnapshot,
+        TestHoodieParquetBinaryCopyBaseSchemaEvolution,TestHoodieBinaryCopyHandleSchemaEvolution,
+        TestHoodieBinaryCopyHandle,TestUpdateSchemaEvolution,TestSparkReaderContextFactory,
+        TestHoodieSchemaConverter,TestSchemaEvolutionContext,TestHoodieParquetInputFormat,
+        TestHoodieCombineHiveInputFormat,TestHoodieArrayWritableSchemaUtils
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 3
+      - name: Select sources (${{ matrix.variant }})
+        run: bash .github/scripts/select_variant.sh "${{ matrix.variant }}" "$BASE_SHA"
+      - name: Set up JDK 11
+        uses: actions/setup-java@v5
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+          architecture: x64
+          cache: maven
+      - name: Build
+        timeout-minutes: 75
+        run: >-
+          bash .github/scripts/mvn_retry.sh install -T 2 -DskipTests -Dscala-2.12 -Dspark3.5 -Dflink2.2 -Phudi-platform-service
+          $MVN_ARGS -am -pl "$MODULES"
+      - name: JUnit tests
+        timeout-minutes: 90
+        run: >-
+          mvn test -DskipTests=false -fae -Dmaven.test.failure.ignore=true -Dscala-2.12 -Dspark3.5 -Dflink2.2
+          -Phudi-platform-service -DwildcardSuites=skipScalaTests -Dtest="$(echo $JUNIT_TESTS | tr -d ' ')"
+          -Dsurefire.failIfNoSpecifiedTests=false
+          $MVN_ARGS -pl "$MODULES"
+      - name: Summary
+        if: ${{ always() }}
+        run: >-
+          python3 .github/scripts/validate_report.py summarize --root . --label "common-deps (${{ matrix.variant }})"
+          --expect "$(echo $JUNIT_TESTS | tr -d ' ')" --collect reports-out
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: reports-common-deps-${{ matrix.variant }}
+          path: reports-out
+          if-no-files-found: warn
+
+  # hudi-spark-datasource, two lanes: s35 = Spark 3.5 / Scala 2.12 / JDK 11 (the default build, plus hudi-utilities in the
+  # "junit" group) and s42 = Spark 4.2 / Scala 2.13 / JDK 17 (the only lane where the upstream CI runs the Scala suites).
+  # JUnit-style classes run through surefire (-Dtest), FunSuite classes through scalatest (-DwildcardSuites);
+  # each invocation switches the other runner off, so nothing outside the lists is executed.
+  spark:
+    name: spark-${{ matrix.lane }}-${{ matrix.group }} (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [fix, base]
+        lane: [s35, s42]
+        group: [blob, ddl, dml, junit]
+        include:
+          - lane: s35
+            group: blob
+            jdk: '11'
+            spark_args: -Dscala-2.12 -Dspark3.5
+            build_modules: hudi-spark-datasource/hudi-spark,hudi-spark-datasource/hudi-spark-common,hudi-spark-datasource/hudi-spark3.5.x
+            junit_tests: TestBatchedBlobReader,TestBlobSupport,TestReadBlobBatching,TestReadBlobSQL,TestBatchedBlobReaderMerge,TestSchemaConverters,TestLanceDataSource,TestHoodieSparkLanceWriter
+            scala_suites: org.apache.spark.sql.hudi.dml.schema.TestBlobDataType,org.apache.hudi.TestHoodieSchemaConversionUtils,org.apache.spark.sql.hudi.dml.others.TestDeleteFromTable,org.apache.spark.sql.hudi.dml.others.TestUpdateTable,org.apache.spark.sql.hudi.procedure.TestClusteringProcedure
+            util_tests: ''
+            extra_args: ''
+            probe: 'yes'
+          - lane: s35
+            group: ddl
+            jdk: '11'
+            spark_args: -Dscala-2.12 -Dspark3.5
+            build_modules: hudi-spark-datasource/hudi-spark,hudi-spark-datasource/hudi-spark-common,hudi-spark-datasource/hudi-spark3.5.x
+            junit_tests: ''
+            scala_suites: org.apache.spark.sql.hudi.ddl.TestSpark3DDL,org.apache.spark.sql.hudi.ddl.TestAlterTable,org.apache.spark.sql.hudi.ddl.TestDropTable,org.apache.spark.sql.hudi.ddl.TestCreateTable,org.apache.spark.sql.hudi.catalog.TestHoodieCatalogDDL,org.apache.spark.sql.hudi.common.TestVectorizedReadWithSchemaEvolution,org.apache.spark.sql.hudi.common.TestNestedSchemaPruningOptimization,org.apache.spark.sql.hudi.common.TestHoodieInternalRowUtils,org.apache.spark.sql.hudi.dml.others.TestTimeTravelTable
+            util_tests: ''
+            extra_args: ''
+            probe: 'no'
+          - lane: s35
+            group: dml
+            jdk: '11'
+            spark_args: -Dscala-2.12 -Dspark3.5
+            build_modules: hudi-spark-datasource/hudi-spark,hudi-spark-datasource/hudi-spark-common,hudi-spark-datasource/hudi-spark3.5.x
+            junit_tests: ''
+            scala_suites: org.apache.spark.sql.hudi.dml.others.TestMergeIntoTable,org.apache.spark.sql.hudi.dml.others.TestPartialUpdateForMergeInto
+            util_tests: ''
+            extra_args: ''
+            probe: 'no'
+          - lane: s35
+            group: junit
+            jdk: '11'
+            spark_args: -Dscala-2.12 -Dspark3.5
+            build_modules: hudi-spark-datasource/hudi-spark,hudi-spark-datasource/hudi-spark-common,hudi-spark-datasource/hudi-spark3.5.x,hudi-utilities
+            junit_tests: TestBasicSchemaEvolution,TestLegacyParquetReadPath,TestCOWDataSource#testSchemaEvolutionWithNewColumns*,TestHoodieRelations,TestSparkInternalSchemaConverter,TestIncrementalQueryWithArchivedInstants,TestHiveTableSchemaEvolution,TestParquetSchemaEvolutionUtils,TestHoodieSchemaUtils
+            scala_suites: ''
+            util_tests: TestUnstructuredFileDFSSource,TestUnstructuredIngestE2E
+            extra_args: -Dflink2.2 -Phudi-platform-service -Pthrift-gen-source
+            probe: 'no'
+          - lane: s42
+            group: blob
+            jdk: '17'
+            spark_args: -Pjava17 -Dscala-2.13 -Dspark4.2
+            build_modules: hudi-spark-datasource/hudi-spark,hudi-spark-datasource/hudi-spark-common,hudi-spark-datasource/hudi-spark4.2.x
+            junit_tests: TestBatchedBlobReader,TestBlobSupport,TestReadBlobBatching,TestReadBlobSQL,TestBatchedBlobReaderMerge,TestSchemaConverters
+            scala_suites: org.apache.spark.sql.hudi.dml.schema.TestBlobDataType,org.apache.hudi.TestHoodieSchemaConversionUtils,org.apache.spark.sql.hudi.dml.others.TestDeleteFromTable,org.apache.spark.sql.hudi.dml.others.TestUpdateTable,org.apache.spark.sql.hudi.procedure.TestClusteringProcedure
+            util_tests: ''
+            extra_args: ''
+            probe: 'yes'
+          - lane: s42
+            group: ddl
+            jdk: '17'
+            spark_args: -Pjava17 -Dscala-2.13 -Dspark4.2
+            build_modules: hudi-spark-datasource/hudi-spark,hudi-spark-datasource/hudi-spark-common,hudi-spark-datasource/hudi-spark4.2.x
+            junit_tests: ''
+            scala_suites: org.apache.spark.sql.hudi.ddl.TestSpark3DDL,org.apache.spark.sql.hudi.ddl.TestAlterTable,org.apache.spark.sql.hudi.ddl.TestDropTable,org.apache.spark.sql.hudi.ddl.TestCreateTable,org.apache.spark.sql.hudi.catalog.TestHoodieCatalogDDL,org.apache.spark.sql.hudi.common.TestVectorizedReadWithSchemaEvolution,org.apache.spark.sql.hudi.common.TestNestedSchemaPruningOptimization,org.apache.spark.sql.hudi.common.TestHoodieInternalRowUtils,org.apache.spark.sql.hudi.dml.others.TestTimeTravelTable
+            util_tests: ''
+            extra_args: ''
+            probe: 'no'
+          - lane: s42
+            group: dml
+            jdk: '17'
+            spark_args: -Pjava17 -Dscala-2.13 -Dspark4.2
+            build_modules: hudi-spark-datasource/hudi-spark,hudi-spark-datasource/hudi-spark-common,hudi-spark-datasource/hudi-spark4.2.x
+            junit_tests: ''
+            scala_suites: org.apache.spark.sql.hudi.dml.others.TestMergeIntoTable,org.apache.spark.sql.hudi.dml.others.TestPartialUpdateForMergeInto,org.apache.spark.sql.hudi.dml.schema.TestVariantDataType,org.apache.spark.sql.hudi.dml.schema.TestVariantShreddingMixedLayouts
+            util_tests: ''
+            extra_args: ''
+            probe: 'no'
+          - lane: s42
+            group: junit
+            jdk: '17'
+            spark_args: -Pjava17 -Dscala-2.13 -Dspark4.2
+            build_modules: hudi-spark-datasource/hudi-spark,hudi-spark-datasource/hudi-spark-common,hudi-spark-datasource/hudi-spark4.2.x
+            junit_tests: TestBasicSchemaEvolution,TestLegacyParquetReadPath,TestCOWDataSource#testSchemaEvolutionWithNewColumns*,TestHoodieRelations,TestSparkInternalSchemaConverter,TestIncrementalQueryWithArchivedInstants,TestHiveTableSchemaEvolution,TestParquetSchemaEvolutionUtils,TestHoodieSchemaUtils
+            scala_suites: ''
+            util_tests: ''
+            extra_args: ''
+            probe: 'no'
+    env:
+      JUNIT_TESTS: ${{ matrix.junit_tests }}
+      SCALA_SUITES: ${{ matrix.scala_suites }}
+      UTIL_TESTS: ${{ matrix.util_tests }}
+      BUILD_MODULES: ${{ matrix.build_modules }}
+      SPARK_ARGS: ${{ matrix.spark_args }}
+      EXTRA_ARGS: ${{ matrix.extra_args }}
+      TEST_MODULES: hudi-spark-datasource/hudi-spark-common,hudi-spark-datasource/hudi-spark
+      LABEL: spark-${{ matrix.lane }}-${{ matrix.group }} (${{ matrix.variant }})
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 3
+      - name: Select sources (${{ matrix.variant }})
+        run: bash .github/scripts/select_variant.sh "${{ matrix.variant }}" "$BASE_SHA"
+      - name: Set up JDK ${{ matrix.jdk }}
+        uses: actions/setup-java@v5
+        with:
+          java-version: ${{ matrix.jdk }}
+          distribution: 'temurin'
+          architecture: x64
+          cache: maven
+      - name: Build
+        timeout-minutes: 100
+        run: >-
+          bash .github/scripts/mvn_retry.sh install -T 2 -DskipTests $SPARK_ARGS $EXTRA_ARGS
+          $MVN_ARGS -am -pl "$BUILD_MODULES"
+      - name: JUnit-style tests (surefire)
+        if: ${{ matrix.junit_tests != '' }}
+        timeout-minutes: 110
+        run: >-
+          mvn test -DskipTests=false -fae -Dmaven.test.failure.ignore=true $SPARK_ARGS $EXTRA_ARGS
+          -DwildcardSuites=skipScalaTests -Dtest="$JUNIT_TESTS" -Dsurefire.failIfNoSpecifiedTests=false
+          $MVN_ARGS -pl "$TEST_MODULES"
+      - name: FunSuite tests (scalatest)
+        if: ${{ !cancelled() && matrix.scala_suites != '' }}
+        timeout-minutes: 140
+        run: >-
+          mvn test -DskipTests=false -fae -Dmaven.test.failure.ignore=true $SPARK_ARGS $EXTRA_ARGS
+          -Dtest=skipJavaTests -DwildcardSuites="$SCALA_SUITES" -Dsurefire.failIfNoSpecifiedTests=false
+          $MVN_ARGS -pl "$TEST_MODULES"
+      - name: hudi-utilities tests (surefire)
+        if: ${{ !cancelled() && matrix.util_tests != '' }}
+        timeout-minutes: 60
+        run: >-
+          mvn test -DskipTests=false -fae -Dmaven.test.failure.ignore=true $SPARK_ARGS $EXTRA_ARGS
+          -DwildcardSuites=skipScalaTests -Dtest="$UTIL_TESTS" -Dsurefire.failIfNoSpecifiedTests=false
+          $MVN_ARGS -pl hudi-utilities
+      - name: Summary
+        if: ${{ always() }}
+        run: |
+          expect="$(printf '%s,%s,%s' "$JUNIT_TESTS" "$SCALA_SUITES" "$UTIL_TESTS" | tr ',' '\n' | sed '/^$/d' | tr '\n' ',' | sed 's/,$//')"
+          python3 .github/scripts/validate_report.py summarize --root . --label "$LABEL" --expect "$expect" --collect reports-out
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: reports-spark-${{ matrix.lane }}-${{ matrix.group }}-${{ matrix.variant }}
+          path: reports-out
+          if-no-files-found: warn
+      # Probe: not an existing test. BLOB column + schema-on-read through ALTER TABLE, compiled and run only now,
+      # after the results above are saved, so a problem in the probe cannot touch them.
+      - name: Probe - BLOB with schema-on-read (Spark SQL)
+        if: ${{ !cancelled() && matrix.probe == 'yes' }}
+        continue-on-error: true
+        timeout-minutes: 60
+        run: |
+          find . -type d -name surefire-reports -prune -exec rm -rf {} +
+          dir=hudi-spark-datasource/hudi-spark/src/test/scala/org/apache/spark/sql/hudi/probe
+          mkdir -p "$dir"
+          cp .github/scripts/probe/TestBlobSchemaOnReadProbe.scala "$dir"/
+          mvn test -DskipTests=false -Dmaven.test.failure.ignore=true $SPARK_ARGS \
+            -Dtest=skipJavaTests -DwildcardSuites=org.apache.spark.sql.hudi.probe -Dsurefire.failIfNoSpecifiedTests=false \
+            $MVN_ARGS -pl hudi-spark-datasource/hudi-spark
+      - name: Probe summary
+        if: ${{ !cancelled() && matrix.probe == 'yes' }}
+        continue-on-error: true
+        run: python3 .github/scripts/validate_report.py summarize --root . --label "spark-${{ matrix.lane }}-probe (${{ matrix.variant }})" --collect probe-out || true
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() && matrix.probe == 'yes' }}
+        with:
+          name: reports-spark-${{ matrix.lane }}-probe-${{ matrix.variant }}
+          path: probe-out
+          if-no-files-found: warn
+
+  flink:
+    name: flink (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 200
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [fix, base]
+    env:
+      FLINK_ARGS: -Dscala-2.12 -Dflink2.2 -Davro.version=1.11.4 -Dparquet.version=1.15.2
+      UNIT_TESTS: TestInternalSchemaManager,TestClusteringOperator,TestClusteringCommitSink,TestClusteringCommitSinkV2,TestRowDataToAvroConverters,TestHoodieFileGroupReaderOnFlink,TestCopyOnWriteInputFormat,TestRecordIterators,TestHoodieSplitReaderFunction,TestAbstractSplitReaderFunction
+      IT_TESTS: ITTestBlobWrite,ITTestSchemaEvolution,ITTestSchemaEvolutionBySQLWithDFSCatalog,ITTestSchemaEvolutionBySQLWithHMSCatalog,ITTestHoodieFlinkClustering,ITTestVectorDataSource
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 3
+      - name: Select sources (${{ matrix.variant }})
+        run: bash .github/scripts/select_variant.sh "${{ matrix.variant }}" "$BASE_SHA"
+      - name: Set up JDK 11
+        uses: actions/setup-java@v5
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+          architecture: x64
+          cache: maven
+      - name: Build
+        timeout-minutes: 60
+        run: >-
+          bash .github/scripts/mvn_retry.sh clean install -T 2 -Pintegration-tests $FLINK_ARGS -pl hudi-flink-datasource/hudi-flink -am
+          -DskipTests=true $MVN_ARGS
+      - name: Unit tests (surefire)
+        timeout-minutes: 45
+        run: >-
+          mvn test -DskipTests=false -fae -Dmaven.test.failure.ignore=true $FLINK_ARGS
+          -DwildcardSuites=skipScalaTests -Dtest="$UNIT_TESTS" -Dsurefire.failIfNoSpecifiedTests=false
+          -pl hudi-flink-datasource/hudi-flink $MVN_ARGS
+      - name: Integration tests (failsafe)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 100
+        run: >-
+          mvn verify -DskipTests=false -Pintegration-tests -Dmaven.test.failure.ignore=true $FLINK_ARGS
+          -Dit.test="$IT_TESTS" -Dit.failIfNoSpecifiedTests=false
+          -pl hudi-flink-datasource/hudi-flink $MVN_ARGS
+      - name: Summary
+        if: ${{ always() }}
+        run: >-
+          python3 .github/scripts/validate_report.py summarize --root . --label "flink (${{ matrix.variant }})"
+          --expect "$UNIT_TESTS,$IT_TESTS" --collect reports-out
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: reports-flink-${{ matrix.variant }}
+          path: reports-out
+          if-no-files-found: warn
+      # Probe: not an existing test. The two calls ClusteringOperator#open makes, on a row type with a BLOB column.
+      - name: Probe - Flink clustering reader schema with a BLOB column
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 30
+        run: |
+          find . -type d \( -name surefire-reports -o -name failsafe-reports \) -prune -exec rm -rf {} +
+          dir=hudi-flink-datasource/hudi-flink/src/test/java/org/apache/hudi/probe
+          mkdir -p "$dir"
+          cp .github/scripts/probe/TestProbeFlinkClusteringBlobSchema.java "$dir"/
+          mvn test -DskipTests=false -Dmaven.test.failure.ignore=true $FLINK_ARGS \
+            -DwildcardSuites=skipScalaTests -Dtest=TestProbeFlinkClusteringBlobSchema -Dsurefire.failIfNoSpecifiedTests=false \
+            -pl hudi-flink-datasource/hudi-flink $MVN_ARGS
+      - name: Probe summary
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: python3 .github/scripts/validate_report.py summarize --root . --label "flink-probe (${{ matrix.variant }})" --collect probe-out || true
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: reports-flink-probe-${{ matrix.variant }}
+          path: probe-out
+          if-no-files-found: warn
+
+  compare:
+    name: compare fix vs base
+    if: ${{ always() }}
+    needs: [common-deps, spark, flink]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          path: all-reports
+          pattern: reports-*
+      - name: Compare
+        run: python3 .github/scripts/validate_report.py compare --root all-reports

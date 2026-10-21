@@ -1,0 +1,267 @@
+name: Validate compatibility probes
+
+# Fork-only. Two things the existing tests cannot show:
+#  1. mixed-version schemas: a BLOB table schema persisted with the old reference ids (0..3) or the new ones
+#     (-13..-16), handled by the fix and by the base commit, which plays the older writer (unit probe, hudi-common);
+#  2. a real table written and ALTERed by the base code (so its persisted InternalSchema carries the old ids),
+#     then reopened, updated, extended and read with the fix (Spark 3.5, schema-on-read).
+# Everything injected here (probe tests) is copied into the work tree at run time and is part of no product commit.
+
+on:
+  push:
+    branches:
+      - 'validate/**'
+    paths:
+      - '.github/workflows/validate-compat.yml'
+      - '.github/scripts/compat/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BASE_SHA: 31f4a5ef2de3023ef3374a42133d6679b06747e5
+  MVN_ARGS: >-
+    -e -ntp -B -V -Dgpg.skip -Djacoco.skip=true -Dcheckstyle.skip=true -Drat.skip=true -Dscalastyle.skip=true
+    -Pwarn-log
+    -Dorg.slf4j.simpleLogger.log.org.apache.maven.plugins.shade=warn
+    -Dorg.slf4j.simpleLogger.log.org.apache.maven.plugins.dependency=warn
+    -Daether.connector.http.retryHandler.count=5
+    -Daether.connector.http.retryHandler.interval=3000
+    -Daether.connector.http.retryHandler.intervalMax=30000
+    -Daether.connector.http.retryHandler.serviceUnavailable=429,500,502,503,504
+    -Daether.connector.http.connectionMaxTtl=25
+    -Dorg.eclipse.jetty.LEVEL=WARN
+
+jobs:
+  mixed-version:
+    name: mixed-version (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [fix, base]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 3
+      - name: Select sources (${{ matrix.variant }})
+        run: bash .github/scripts/select_variant.sh "${{ matrix.variant }}" "$BASE_SHA"
+      - name: Set up JDK 11
+        uses: actions/setup-java@v5
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+          architecture: x64
+          cache: maven
+      - name: Build hudi-common
+        timeout-minutes: 30
+        run: bash .github/scripts/mvn_retry.sh install -T 2 -DskipTests -Dscala-2.12 -Dspark3.5 $MVN_ARGS -am -pl hudi-common
+      - name: Probe - mixed-version BLOB schema
+        continue-on-error: true
+        timeout-minutes: 20
+        run: |
+          dir=hudi-common/src/test/java/org/apache/hudi/common/schema/internal/probe
+          mkdir -p "$dir"
+          cp .github/scripts/compat/TestProbeBlobIdsMixedVersions.java "$dir"/
+          mvn test -DskipTests=false -Dmaven.test.failure.ignore=true -Dscala-2.12 -Dspark3.5 \
+            -Dtest=TestProbeBlobIdsMixedVersions -Dsurefire.failIfNoSpecifiedTests=false $MVN_ARGS -pl hudi-common
+      - name: Summary
+        if: ${{ always() }}
+        run: python3 .github/scripts/validate_report.py summarize --root . --label "mixed-version (${{ matrix.variant }})" --expect TestProbeBlobIdsMixedVersions --collect reports-out || true
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: reports-mixed-version-probe-${{ matrix.variant }}
+          path: reports-out
+          if-no-files-found: warn
+
+  two-blobs:
+    name: two-blobs (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [fix, base]
+    env:
+      SPARK_ARGS: -Dscala-2.12 -Dspark3.5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 3
+      - name: Select sources (${{ matrix.variant }})
+        run: bash .github/scripts/select_variant.sh "${{ matrix.variant }}" "$BASE_SHA"
+      - name: Set up JDK 11
+        uses: actions/setup-java@v5
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+          architecture: x64
+          cache: maven
+      - name: Build Spark modules
+        timeout-minutes: 60
+        run: >-
+          bash .github/scripts/mvn_retry.sh install -T 2 -DskipTests $SPARK_ARGS $MVN_ARGS -am
+          -pl hudi-spark-datasource/hudi-spark,hudi-spark-datasource/hudi-spark-common,hudi-spark-datasource/hudi-spark3.5.x
+      - name: Probe - several and nested BLOB columns with schema-on-read
+        continue-on-error: true
+        timeout-minutes: 30
+        run: |
+          dir=hudi-spark-datasource/hudi-spark/src/test/scala/org/apache/spark/sql/hudi/probe
+          mkdir -p "$dir"
+          cp .github/scripts/compat/TestProbeTwoBlobColumns.scala "$dir"/
+          mvn test -DskipTests=false -Dmaven.test.failure.ignore=true $SPARK_ARGS \
+            -Dtest=skipJavaTests -DwildcardSuites=org.apache.spark.sql.hudi.probe.TestProbeTwoBlobColumns \
+            -Dsurefire.failIfNoSpecifiedTests=false $MVN_ARGS -pl hudi-spark-datasource/hudi-spark
+      - name: Summary
+        if: ${{ always() }}
+        run: python3 .github/scripts/validate_report.py summarize --root . --label "two-blobs (${{ matrix.variant }})" --expect TestProbeTwoBlobColumns --collect reports-out || true
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: reports-two-blobs-probe-${{ matrix.variant }}
+          path: reports-out
+          if-no-files-found: warn
+
+  downgrade:
+    name: downgrade (schema-on-read + reconcile, no ALTER)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      TABLE_ROOT: /tmp/downgrade-blob-table
+      SPARK_ARGS: -Dscala-2.12 -Dspark3.5
+      PROBE_DIR: hudi-spark-datasource/hudi-spark/src/test/scala/org/apache/spark/sql/hudi/probe
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 3
+      - name: Start from the base commit
+        run: bash .github/scripts/select_variant.sh base "$BASE_SHA"
+      - name: Set up JDK 11
+        uses: actions/setup-java@v5
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+          architecture: x64
+          cache: maven
+      - name: Build Spark modules with the base hudi-common
+        timeout-minutes: 60
+        run: >-
+          bash .github/scripts/mvn_retry.sh install -T 2 -DskipTests $SPARK_ARGS $MVN_ARGS -am
+          -pl hudi-spark-datasource/hudi-spark,hudi-spark-datasource/hudi-spark-common,hudi-spark-datasource/hudi-spark3.5.x
+      - name: Install the probe
+        run: |
+          rm -rf "$TABLE_ROOT" reports-out
+          mkdir -p "$PROBE_DIR"
+          cp .github/scripts/compat/TestProbeDowngradeStep.scala "$PROBE_DIR"/
+      - name: Control 1 - base creates and updates table ctl
+        continue-on-error: true
+        timeout-minutes: 20
+        run: bash .github/scripts/compat/run_downgrade_step.sh create ctl "step 1 base creates ctl"
+      - name: Control 2 - base updates table ctl again
+        continue-on-error: true
+        timeout-minutes: 20
+        run: bash .github/scripts/compat/run_downgrade_step.sh update ctl "step 2 base updates ctl"
+      - name: Switch hudi-common to the fix
+        timeout-minutes: 20
+        run: |
+          git checkout HEAD -- hudi-common
+          echo "files differing from base in hudi-common:" "$(git diff --name-only "$BASE_SHA" -- hudi-common | wc -l)"
+          bash .github/scripts/mvn_retry.sh install -T 2 -DskipTests $SPARK_ARGS $MVN_ARGS -pl hudi-common
+      - name: Fix creates and updates table dg
+        continue-on-error: true
+        timeout-minutes: 20
+        run: bash .github/scripts/compat/run_downgrade_step.sh create dg "step 3 fix creates dg"
+      - name: Fix updates table dg again
+        continue-on-error: true
+        timeout-minutes: 20
+        run: bash .github/scripts/compat/run_downgrade_step.sh update dg "step 4 fix updates dg"
+      - name: Fix updates table ctl that the base created (upgrade)
+        continue-on-error: true
+        timeout-minutes: 20
+        run: bash .github/scripts/compat/run_downgrade_step.sh update ctl "step 5 fix updates ctl written by base"
+      - name: Switch hudi-common back to the base
+        timeout-minutes: 20
+        run: |
+          git checkout "$BASE_SHA" -- hudi-common
+          echo "files differing from base in hudi-common:" "$(git diff --name-only "$BASE_SHA" -- hudi-common | wc -l)"
+          bash .github/scripts/mvn_retry.sh install -T 2 -DskipTests $SPARK_ARGS $MVN_ARGS -pl hudi-common
+      - name: Base updates table dg that the fix wrote (downgrade)
+        continue-on-error: true
+        timeout-minutes: 20
+        run: bash .github/scripts/compat/run_downgrade_step.sh update dg "step 6 base updates dg written by fix"
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: reports-downgrade-probe-steps
+          path: reports-out
+          if-no-files-found: warn
+
+  legacy-table:
+    name: legacy-table (base writes, fix reads)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      TABLE_ROOT: /tmp/legacy-blob-table
+      SPARK_ARGS: -Dscala-2.12 -Dspark3.5
+      PROBE_DIR: hudi-spark-datasource/hudi-spark/src/test/scala/org/apache/spark/sql/hudi/probe
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 3
+      - name: Put hudi-common back to the base commit (the table is written by 1.2.x-like code)
+        run: bash .github/scripts/select_variant.sh base "$BASE_SHA"
+      - name: Set up JDK 11
+        uses: actions/setup-java@v5
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+          architecture: x64
+          cache: maven
+      - name: Build Spark modules with the base hudi-common
+        timeout-minutes: 60
+        run: >-
+          bash .github/scripts/mvn_retry.sh install -T 2 -DskipTests $SPARK_ARGS $MVN_ARGS -am
+          -pl hudi-spark-datasource/hudi-spark,hudi-spark-datasource/hudi-spark-common,hudi-spark-datasource/hudi-spark3.5.x
+      - name: Phase 1 - create and ALTER BLOB tables with the base code
+        timeout-minutes: 30
+        run: |
+          rm -rf "$TABLE_ROOT"
+          mkdir -p "$PROBE_DIR"
+          cp .github/scripts/compat/TestProbeLegacyBlobPhase1.scala "$PROBE_DIR"/
+          mvn test -DskipTests=false -Dmaven.test.failure.ignore=true $SPARK_ARGS \
+            -Dtest=skipJavaTests -DwildcardSuites=org.apache.spark.sql.hudi.probe.TestProbeLegacyBlobPhase1 \
+            -Dsurefire.failIfNoSpecifiedTests=false $MVN_ARGS -pl hudi-spark-datasource/hudi-spark
+      - name: Phase 1 result and the ids the base code persisted
+        run: |
+          python3 .github/scripts/validate_report.py summarize --root hudi-spark-datasource/hudi-spark/target --label "legacy-table phase 1 (base code)" --expect TestProbeLegacyBlobPhase1
+          python3 .github/scripts/compat/print_blob_ids.py "$TABLE_ROOT" --expect legacy
+      - name: Switch hudi-common to the fix and rebuild only it
+        timeout-minutes: 30
+        run: |
+          git checkout HEAD -- hudi-common
+          git diff --stat HEAD -- hudi-common | tail -1
+          git diff --stat 31f4a5ef2de3023ef3374a42133d6679b06747e5 -- hudi-common | tail -1
+          bash .github/scripts/mvn_retry.sh install -T 2 -DskipTests $SPARK_ARGS $MVN_ARGS -pl hudi-common
+      - name: Phase 2 - read, update, insert and ALTER the same tables with the fix
+        timeout-minutes: 30
+        run: |
+          find . -type d -name surefire-reports -prune -exec rm -rf {} +
+          rm -f "$PROBE_DIR"/TestProbeLegacyBlobPhase1.scala
+          cp .github/scripts/compat/TestProbeLegacyBlobPhase2.scala "$PROBE_DIR"/
+          mvn test -DskipTests=false -Dmaven.test.failure.ignore=true $SPARK_ARGS \
+            -Dtest=skipJavaTests -DwildcardSuites=org.apache.spark.sql.hudi.probe.TestProbeLegacyBlobPhase2 \
+            -Dsurefire.failIfNoSpecifiedTests=false $MVN_ARGS -pl hudi-spark-datasource/hudi-spark
+      - name: Phase 2 result and the ids now persisted
+        if: ${{ always() }}
+        run: |
+          python3 .github/scripts/compat/print_blob_ids.py "$TABLE_ROOT" || true
+          python3 .github/scripts/validate_report.py summarize --root . --label "legacy-table phase 2 (fix code)" --expect TestProbeLegacyBlobPhase2 --collect reports-out
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: reports-legacy-table-probe-fix
+          path: reports-out
+          if-no-files-found: warn
