@@ -1,0 +1,153 @@
+name: Validate hudi-common id test
+
+on:
+  push:
+    branches:
+      - 'validate/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  MVN_ARGS: -e -ntp -B -V -Dgpg.skip -Djacoco.skip -Dscala-2.12 -Dspark3.5 -Dflink2.2
+  NEW_TEST: TestInternalSchemaConverter#testNonNegativeFieldIdsAreUniqueWithSeveralBlobAndVariantColumns
+  BASE_SHA: 31f4a5ef2de
+  FIX_SHA: e875141d826
+  CONVERTER: hudi-common/src/main/java/org/apache/hudi/common/schema/internal/convert/InternalSchemaConverter.java
+  SERDE: hudi-common/src/main/java/org/apache/hudi/common/schema/internal/utils/SerDeHelper.java
+  TEST_FILE: hudi-common/src/test/java/org/apache/hudi/common/schema/internal/convert/TestInternalSchemaConverter.java
+
+jobs:
+  # 1. the new test alone, with the fix: must pass
+  with-fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 5
+      - name: Check the shape of the branch
+        run: bash .github/scripts/idtest_shape.sh
+      - name: Set up JDK 11
+        uses: actions/setup-java@v5
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+          architecture: x64
+          cache: maven
+      - name: Build hudi-common and the modules it needs
+        run: mvn install -DskipTests -pl hudi-common -am $MVN_ARGS
+      - name: Run the new test
+        run: mvn test -Punit-tests -pl hudi-common -Dtest="$NEW_TEST" $MVN_ARGS
+      - name: Check that the new test ran alone and passed
+        run: python3 .github/scripts/idtest_report.py pass
+
+  # 2. the new test alone, on the base commit's two production files: must fail on the first assertion
+  without-fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 5
+      - name: Check the shape of the branch
+        run: bash .github/scripts/idtest_shape.sh
+      - name: Put the two main sources back to the base commit
+        run: |
+          set -eu
+          git cat-file -e "${BASE_SHA}^{commit}"
+          git checkout "${BASE_SHA}" -- "$CONVERTER" "$SERDE"
+          git status --short
+          for f in "$CONVERTER" "$SERDE"; do
+            if git diff --quiet HEAD -- "$f"; then echo "restoring $f changed nothing"; exit 1; fi
+          done
+          test "$(git diff --name-only HEAD | sort)" = "$(printf '%s\n%s\n' "$CONVERTER" "$SERDE" | sort)"
+          echo "reference field ids in the restored converter:"
+          grep -n 'Types.Field.get([0-3], ' "$CONVERTER"
+          test "$(grep -c 'Types.Field.get([0-3], ' "$CONVERTER")" = 4
+          if grep -q 'BLOB_REFERENCE_PATH_FIELD_ID' "$CONVERTER"; then echo "the fix is still in the converter"; exit 1; fi
+      - name: Set up JDK 11
+        uses: actions/setup-java@v5
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+          architecture: x64
+          cache: maven
+      - name: Build hudi-common and the modules it needs
+        run: mvn install -DskipTests -pl hudi-common -am $MVN_ARGS
+      - name: Run the new test (expected to fail)
+        id: tests
+        continue-on-error: true
+        run: mvn test -Punit-tests -pl hudi-common -Dtest="$NEW_TEST" $MVN_ARGS
+      - name: Check that the new test failed on its first assertion
+        run: |
+          set -eu
+          echo "test step outcome: ${{ steps.tests.outcome }}"
+          test "${{ steps.tests.outcome }}" = "failure"
+          python3 .github/scripts/idtest_report.py fail "non-negative field ids used by more than one field"
+
+  # 3. the whole hudi-common unit-test suite, with the fix: no failures
+  with-fix-module:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 5
+      - name: Check the shape of the branch
+        run: bash .github/scripts/idtest_shape.sh
+      - name: Set up JDK 11
+        uses: actions/setup-java@v5
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+          architecture: x64
+          cache: maven
+      - name: Build hudi-common and the modules it needs
+        run: mvn install -DskipTests -pl hudi-common -am $MVN_ARGS
+      - name: Run every unit test of hudi-common
+        run: mvn test -Punit-tests -pl hudi-common $MVN_ARGS
+      - name: Check the totals
+        run: python3 .github/scripts/idtest_report.py module
+
+  # 4. teeth of the second assertion: with a negative id on an array element (a field outside any BLOB or
+  #    VARIANT) in the converter, the new test must fail on "negative field ids outside ..."
+  negative-id-outside-blob:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 5
+      - name: Check the shape of the branch
+        run: bash .github/scripts/idtest_shape.sh
+      - name: Give the array element a negative id in the converter
+        run: |
+          set -eu
+          sed -i.bak 's/Types\.ArrayType\.get(elementId, schema\.getElementType()\.isNullable(), elementType)/Types.ArrayType.get(-20, schema.getElementType().isNullable(), elementType)/' "$CONVERTER"
+          rm "$CONVERTER.bak"
+          git diff --stat
+          git diff -U0
+          test "$(git diff --name-only)" = "$CONVERTER"
+          test "$(git diff -U0 | grep -c '^+[^+]')" = 1
+          grep -n 'Types.ArrayType.get(-20, ' "$CONVERTER"
+      - name: Set up JDK 11
+        uses: actions/setup-java@v5
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+          architecture: x64
+          cache: maven
+      - name: Build hudi-common and the modules it needs
+        run: mvn install -DskipTests -pl hudi-common -am $MVN_ARGS
+      - name: Run the new test (expected to fail)
+        id: tests
+        continue-on-error: true
+        run: mvn test -Punit-tests -pl hudi-common -Dtest="$NEW_TEST" $MVN_ARGS
+      - name: Check that the new test failed on its second assertion
+        run: |
+          set -eu
+          echo "test step outcome: ${{ steps.tests.outcome }}"
+          test "${{ steps.tests.outcome }}" = "failure"
+          python3 .github/scripts/idtest_report.py fail "negative field ids outside the BLOB and VARIANT columns"
