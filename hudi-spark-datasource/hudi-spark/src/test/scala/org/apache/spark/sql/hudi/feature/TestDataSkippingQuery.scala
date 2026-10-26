@@ -270,4 +270,66 @@ class TestDataSkippingQuery extends HoodieSparkSqlTestBase {
       }
     }
   }
+
+  test("Test LIKE prefix data skipping keeps files whose values all start with the prefix") {
+    Seq("cow", "mor").foreach { tableType =>
+      withTempDir { tmp =>
+        val tableName = generateTableName
+        withSQLConf(
+          "hoodie.metadata.enable" -> "true",
+          "hoodie.metadata.index.column.stats.enable" -> "true",
+          "hoodie.enable.data.skipping" -> "true",
+          "hoodie.metadata.index.column.stats.column.list" -> "s",
+          // keep every commit in its own base file so column-stats pruning has multiple files
+          "hoodie.parquet.small.file.limit" -> "0"
+        ) {
+          spark.sql(
+            s"""
+               |create table $tableName (
+               |  id int,
+               |  s string,
+               |  ts long
+               |) using hudi
+               | tblproperties (primaryKey = 'id', orderingFields = 'ts', type = '$tableType')
+               | location '${tmp.getCanonicalPath}'
+                  """.stripMargin)
+          // Prefix-contained file: min='abc1', max='abc9'. Equality-style StartsWith translation
+          // treats this as min <= 'abc' AND max >= 'abc' and wrongly drops the file.
+          spark.sql(s"insert into $tableName values (1, 'abc1', 1000), (2, 'abc9', 1000)")
+          // Straddle: min='aba', max='adf', includes a matching value.
+          spark.sql(s"insert into $tableName values (3, 'aba', 2000), (4, 'abc', 2000), (5, 'adf', 2000)")
+          // Entirely before the prefix.
+          spark.sql(s"insert into $tableName values (6, 'aaa', 3000), (7, 'abb', 3000)")
+          // Entirely after the prefix.
+          spark.sql(s"insert into $tableName values (8, 'abd', 4000), (9, 'zzz', 4000)")
+
+          checkAnswer(s"select id, s from $tableName where s like 'abc%'")(
+            Seq(1, "abc1"),
+            Seq(2, "abc9"),
+            Seq(4, "abc")
+          )
+          checkAnswer(s"select id, s from $tableName where s not like 'abc%'")(
+            Seq(3, "aba"),
+            Seq(5, "adf"),
+            Seq(6, "aaa"),
+            Seq(7, "abb"),
+            Seq(8, "abd"),
+            Seq(9, "zzz")
+          )
+          // Adjacent: equality still requires the literal itself to fall in [min, max].
+          checkAnswer(s"select id, s from $tableName where s = 'abc'")(
+            Seq(4, "abc")
+          )
+
+          withSQLConf("hoodie.enable.data.skipping" -> "false") {
+            checkAnswer(s"select id, s from $tableName where s like 'abc%'")(
+              Seq(1, "abc1"),
+              Seq(2, "abc9"),
+              Seq(4, "abc")
+            )
+          }
+        }
+      }
+    }
+  }
 }
