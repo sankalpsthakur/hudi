@@ -320,17 +320,18 @@ object DataSkippingUtils extends Logging {
           Option.empty
         })
 
-      // Filter "colA like 'xxx%'"
-      // Translates to "colA_minValue <= xxx AND xxx <= colA_maxValue" for index lookup
+      // Filter "colA like 'xxx%'" (Spark rewrites this to StartsWith(colA, 'xxx'))
+      // Translates to "colA_maxValue >= xxx AND (colA_minValue <= xxx OR colA_minValue like 'xxx%')"
       //
-      // NOTE: Since a) this operator matches strings by prefix and b) given that this column is going to be ordered
-      //       lexicographically, we essentially need to check that provided literal falls w/in min/max bounds of the
-      //       given column
+      // NOTE: Every string starting with P is >= P, so a file with max < P cannot hold a match.
+      //       A file is also match-free when min is strictly after every P-prefixed string, i.e.
+      //       min > P and min itself does not start with P. Equality's min <= P && max >= P is
+      //       unsound here: min = 'abc1' is > 'abc' even though 'abc1' starts with 'abc'.
       case StartsWith(sourceExpr @ AllowedTransformationExpression(attrRef), v @ Literal(_: UTF8String, _)) =>
         getTargetIndexedColumnName(attrRef, indexedCols)
           .map { colName =>
             val targetExprBuilder: Expression => Expression = swapAttributeRefInExpr(sourceExpr, attrRef, _)
-            genColumnValuesEqualToExpression(colName, v, targetExprBuilder)
+            genColumnValuesStartsWithPrefixExpression(colName, v, targetExprBuilder)
           }.orElse({
           Option.empty
         })
@@ -499,6 +500,18 @@ object ColumnStatsExpressionUtils {
     val maxValueExpr = targetExprBuilder.apply(genColMaxValueExpr(colName))
     // Only case when column C contains value V is when min(C) <= V <= max(c)
     And(LessThanOrEqual(minValueExpr, value), GreaterThanOrEqual(maxValueExpr, value))
+  }
+
+  @inline def genColumnValuesStartsWithPrefixExpression(colName: String,
+                                                        prefix: Expression,
+                                                        targetExprBuilder: Function[Expression, Expression] = Predef.identity): Expression = {
+    val minValueExpr = targetExprBuilder.apply(genColMinValueExpr(colName))
+    val maxValueExpr = targetExprBuilder.apply(genColMaxValueExpr(colName))
+    // Keep the file iff [min, max] can overlap any string starting with P:
+    // max >= P, and min's |P|-length prefix is <= P (min <= P or min itself starts with P).
+    And(
+      GreaterThanOrEqual(maxValueExpr, prefix),
+      Or(LessThanOrEqual(minValueExpr, prefix), StartsWith(minValueExpr, prefix)))
   }
 
   def genColumnOnlyValuesEqualToExpression(colName: String,

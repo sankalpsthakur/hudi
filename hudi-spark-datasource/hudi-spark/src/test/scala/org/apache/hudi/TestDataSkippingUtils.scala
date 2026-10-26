@@ -174,11 +174,53 @@ object TestDataSkippingUtils {
       arguments(
         sparkAdapter.getExpressionFromColumn(col("B").startsWith("abc")),
         Seq(
-          IndexRow("file_1", valueCount = 1, B_minValue = "aba", B_maxValue = "adf", B_nullCount = 1), // may contain strings starting w/ "abc"
-          IndexRow("file_2", valueCount = 1, B_minValue = "adf", B_maxValue = "azy", B_nullCount = 0),
-          IndexRow("file_3", valueCount = 1, B_minValue = "aaa", B_maxValue = "aba", B_nullCount = 0)
+          IndexRow("file_1", valueCount = 1, B_minValue = "aba", B_maxValue = "adf", B_nullCount = 1), // straddles "abc"
+          IndexRow("file_2", valueCount = 1, B_minValue = "adf", B_maxValue = "azy", B_nullCount = 0), // entirely after
+          IndexRow("file_3", valueCount = 1, B_minValue = "aaa", B_maxValue = "aba", B_nullCount = 0), // entirely before
+          // All values start with "abc" and sort after the prefix itself ('abc1' > 'abc').
+          // Equality-style min <= prefix would prune this file.
+          IndexRow("file_4", valueCount = 2, B_minValue = "abc1", B_maxValue = "abc9", B_nullCount = 0)
         ),
-        Seq("file_1")),
+        Seq("file_1", "file_4")),
+      arguments(
+        sparkAdapter.getExpressionFromColumn(col("B").startsWith("abc")),
+        Seq(
+          IndexRow("file_shorter_overlap", valueCount = 2, B_minValue = "ab", B_maxValue = "abd", B_nullCount = 0),
+          IndexRow("file_shorter_before", valueCount = 2, B_minValue = "a", B_maxValue = "ab", B_nullCount = 0),
+          IndexRow("file_exact_prefix", valueCount = 1, B_minValue = "abc", B_maxValue = "abc", B_nullCount = 0)
+        ),
+        Seq("file_shorter_overlap", "file_exact_prefix")),
+      arguments(
+        sparkAdapter.getExpressionFromColumn(col("B").startsWith("")),
+        Seq(
+          IndexRow("file_1", valueCount = 1, B_minValue = "abc1", B_maxValue = "abc9", B_nullCount = 0),
+          IndexRow("file_2", valueCount = 1, B_minValue = "zzz", B_maxValue = "zzz", B_nullCount = 0)
+        ),
+        Seq("file_1", "file_2")),
+      arguments(
+        sparkAdapter.getExpressionFromColumn(col("B").startsWith("\u00e9")),
+        Seq(
+          IndexRow("file_match", valueCount = 2, B_minValue = "\u00e9a", B_maxValue = "\u00e9z", B_nullCount = 0),
+          IndexRow("file_before", valueCount = 2, B_minValue = "\u00e1", B_maxValue = "\u00e4", B_nullCount = 0),
+          IndexRow("file_after", valueCount = 2, B_minValue = "\u00eaa", B_maxValue = "\u00eaz", B_nullCount = 0)
+        ),
+        Seq("file_match")),
+      arguments(
+        sparkAdapter.getExpressionFromColumn(col("B").startsWith("\uFFFF")),
+        Seq(
+          IndexRow("file_match", valueCount = 2, B_minValue = "\uFFFFa", B_maxValue = "\uFFFFz", B_nullCount = 0),
+          IndexRow("file_before", valueCount = 1, B_minValue = "a", B_maxValue = "z", B_nullCount = 0)
+        ),
+        Seq("file_match")),
+      arguments(
+        // Adjacent: equality still requires the prefix itself to fall in [min, max]
+        sparkAdapter.getExpressionFromColumn(col("B") === "abc"),
+        Seq(
+          IndexRow("file_prefix_contained", valueCount = 2, B_minValue = "abc1", B_maxValue = "abc9", B_nullCount = 0),
+          IndexRow("file_straddle", valueCount = 2, B_minValue = "aba", B_maxValue = "adf", B_nullCount = 0),
+          IndexRow("file_exact", valueCount = 1, B_minValue = "abc", B_maxValue = "abc", B_nullCount = 0)
+        ),
+        Seq("file_straddle", "file_exact")),
       arguments(
         Not(sparkAdapter.getExpressionFromColumn(col("B").startsWith("abc"))),
         Seq(
@@ -301,7 +343,26 @@ object TestDataSkippingUtils {
             C_maxValue = new Timestamp(1648785048000L), // 04/01/2022
             C_nullCount = 0)
         ),
-        Seq("file_2"))
+        Seq("file_2")),
+      arguments(
+        // Positive StartsWith through an order-preserving transform. File_1's formatted min
+        // '2022-03-07' sorts after the prefix '2022-03'; equality-style translation would prune it.
+        sparkAdapter.getExpressionFromColumn(date_format(col("C"), "yyyy-MM-dd").startsWith("2022-03")),
+        Seq(
+          IndexRow("file_1", valueCount = 2,
+            C_minValue = new Timestamp(1646625048000L), // 03/07/2022
+            C_maxValue = new Timestamp(1646797848000L), // 03/09/2022
+            C_nullCount = 0),
+          IndexRow("file_2", valueCount = 2,
+            C_minValue = new Timestamp(1646711448000L), // 03/08/2022
+            C_maxValue = new Timestamp(1648785048000L), // 04/01/2022
+            C_nullCount = 0),
+          IndexRow("file_3", valueCount = 2,
+            C_minValue = new Timestamp(1648785048000L), // 04/01/2022
+            C_maxValue = new Timestamp(1648871448000L), // 04/02/2022
+            C_nullCount = 0)
+        ),
+        Seq("file_1", "file_2"))
     )
   }
 
